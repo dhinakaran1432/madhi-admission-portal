@@ -1,6 +1,8 @@
 {
   "version": 2,
+  "framework": null,
   "buildCommand": "prisma generate",
+  "outputDirectory": "public",
   "installCommand": "npm install",
   "headers": [
     {
