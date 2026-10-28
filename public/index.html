@@ -1,0 +1,1711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0B2D5C">
+<meta name="description" content="Madhi School Admission Portal - Apply online, track status, pay fees">
+<title>Madhi School Admission Portal</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="stylesheet" href="/style.css">
+<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js" defer></script>
+</head>
+<body>
+<div id="app"></div>
+<script>
+'use strict';
+
+/* ============================================================
+   CONFIG
+   ============================================================ */
+const API_URL = '/api/sync';
+const API_KEY = 'madhi_secret_key_change_me_2026';
+const K_SESSION = 'madhi.session';
+const K_CACHE = 'madhi.cache';
+const OWNER_USERNAME = 'owner';
+const OWNER_PASSWORD = 'owner123';
+const POLL_INTERVAL = 8000;
+const DEBUG = false;
+const log = (...a) => { if (DEBUG) console.log('[Madhi]', ...a); };
+
+/* ============================================================
+   DEFAULT STATE
+   ============================================================ */
+const DEFAULT_STATE = {
+  users: [],
+  applications: [],
+  payments: [],
+  announcements: [],
+  expenses: [],
+  orders: [],
+  notifications: [],
+  points: {},
+  badges: {},
+  settings: {
+    schoolName: 'Madhi',
+    tagline: 'Excellence in Education',
+    upiId: 'madhi@upi',
+    applicationFee: 500,
+    address: '123 School Street, Tamil Nadu',
+    phone: '+91 90000 00000'
+  }
+};
+
+const STORE_ITEMS = [
+  { id: 'uniform', name: 'School Uniform', icon: '👕', desc: 'Complete 3-set uniform', price: 800, mrp: 1200 },
+  { id: 'books', name: 'Textbook Set', icon: '📚', desc: 'All grades textbook bundle', price: 1500, mrp: 2000 },
+  { id: 'sports', name: 'Sports Kit', icon: '⚽', desc: 'PE uniform + shoes', price: 500, mrp: 700 },
+  { id: 'costume', name: 'Annual Day Costume', icon: '🎭', desc: 'Custom fitted costume', price: 300, mrp: 450 },
+  { id: 'bag', name: 'School Bag', icon: '🎒', desc: 'Official Madhi backpack', price: 600, mrp: 900 },
+  { id: 'stationery', name: 'Stationery Kit', icon: '✏️', desc: 'Complete stationery pack', price: 200, mrp: 350 }
+];
+
+const BADGES = [
+  { id: 'first_step', name: 'First Step', icon: '👣', desc: 'Register on Madhi portal' },
+  { id: 'profile_pro', name: 'Profile Pro', icon: '✨', desc: 'Complete your profile' },
+  { id: 'applicant', name: 'Applicant', icon: '📝', desc: 'Submit an application' },
+  { id: 'paid_up', name: 'Paid Up', icon: '💳', desc: 'Pay application fee' },
+  { id: 'approved', name: 'Approved!', icon: '🎉', desc: 'Get admission approved' },
+  { id: 'streak_3', name: 'Streak Starter', icon: '🔥', desc: '3-day login streak' },
+  { id: 'streak_7', name: 'Week Warrior', icon: '⚡', desc: '7-day login streak' },
+  { id: 'streak_30', name: 'Monthly Master', icon: '👑', desc: '30-day login streak' },
+  { id: 'pts_100', name: '100 Club', icon: '💯', desc: 'Earn 100 points' },
+  { id: 'pts_500', name: '500 Club', icon: '🏆', desc: 'Earn 500 points' },
+  { id: 'early', name: 'Early Bird', icon: '🌅', desc: 'Apply within 7 days' },
+  { id: 'referrer', name: 'Referrer', icon: '🤝', desc: 'Refer a friend' }
+];
+
+/* ============================================================
+   RUNTIME STATE
+   ============================================================ */
+let state = JSON.parse(JSON.stringify(DEFAULT_STATE));
+let currentUser = null;
+let currentView = 'landing';
+let pollTimer = null;
+let lastServerUpdatedAt = null;
+let deferredPrompt = null;
+let pendingAppData = null;
+
+/* ============================================================
+   CRYPTO
+   ============================================================ */
+async function sha256(str) {
+  const enc = new TextEncoder().encode(str);
+  const buf = await crypto.subtle.digest('SHA-256', enc);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function newHash(password) {
+  return sha256('madhi$v1$' + password);
+}
+
+async function verifyHash(password, stored) {
+  if (!stored) return false;
+  if (!/^[a-f0-9]{64}$/.test(stored)) return stored === password;
+  const candidates = ['madhi$v1$' + password, 'madhi$' + password, 'madhi' + password, password];
+  for (const salt of candidates) {
+    const h = await sha256(salt);
+    if (h === stored) return true;
+  }
+  return false;
+}
+
+/* ============================================================
+   API
+   ============================================================ */
+async function apiGet() {
+  const res = await fetch(API_URL, { headers: { 'X-Api-Key': API_KEY } });
+  if (!res.ok) throw new Error('GET ' + res.status);
+  return res.json();
+}
+
+async function apiPut(data) {
+  const res = await fetch(API_URL, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'X-Api-Key': API_KEY },
+    body: JSON.stringify({ data })
+  });
+  if (!res.ok) throw new Error('PUT ' + res.status);
+  return res.json();
+}
+
+/* ============================================================
+   PERSISTENCE
+   ============================================================ */
+function saveLocal() {
+  try { localStorage.setItem(K_CACHE, JSON.stringify(state)); } catch (e) { log('save fail', e); }
+}
+
+function loadLocal() {
+  try {
+    const raw = localStorage.getItem(K_CACHE);
+    if (raw) state = Object.assign({}, DEFAULT_STATE, JSON.parse(raw));
+  } catch (e) { log('load fail', e); }
+}
+
+async function save() {
+  saveLocal();
+  try {
+    const res = await apiPut(state);
+    lastServerUpdatedAt = res.updatedAt;
+  } catch (e) { log('server save fail', e); }
+}
+
+async function bootPull() {
+  try {
+    const res = await apiGet();
+    if (res && res.data) {
+      state = Object.assign({}, DEFAULT_STATE, res.data);
+      lastServerUpdatedAt = res.updatedAt;
+      saveLocal();
+    }
+  } catch (e) {
+    log('boot pull fail', e);
+    loadLocal();
+  }
+}
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+const fmtDate = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
+const fmtDateTime = (d) => d ? new Date(d).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
+const fmtINR = (n) => '₹' + Number(n || 0).toLocaleString('en-IN');
+
+function escapeHTML(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function toast(msg, type = 'info') {
+  const el = document.getElementById('toast');
+  if (!el) return;
+  el.className = 'toast toast--' + type + ' toast--show';
+  el.textContent = msg;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('toast--show'), 3500);
+}
+
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const yesterdayStr = () => new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+
+/* ============================================================
+   SESSION
+   ============================================================ */
+function setSession(username) {
+  currentUser = state.users.find(u => u.username === username) || null;
+  if (currentUser) localStorage.setItem(K_SESSION, JSON.stringify({ username, at: Date.now() }));
+}
+
+function clearSession() {
+  currentUser = null;
+  localStorage.removeItem(K_SESSION);
+  stopPolling();
+}
+
+function restoreSession() {
+  try {
+    const raw = localStorage.getItem(K_SESSION);
+    if (!raw) return;
+    const { username } = JSON.parse(raw);
+    currentUser = state.users.find(u => u.username === username) || null;
+  } catch (e) { log('restore session fail', e); }
+}
+
+/* ============================================================
+   OWNER SEED
+   ============================================================ */
+async function ensureOwner() {
+  if (state.users.find(u => u.username === OWNER_USERNAME)) return;
+  const hash = await newHash(OWNER_PASSWORD);
+  state.users.push({
+    id: uid(),
+    username: OWNER_USERNAME,
+    passwordHash: hash,
+    name: 'School Admin',
+    role: 'owner',
+    phone: '',
+    email: '',
+    joinedAt: new Date().toISOString(),
+    membershipStatus: 'active',
+    streak: 0,
+    lastLoginDate: ''
+  });
+  await save();
+}
+
+/* ============================================================
+   POLLING
+   ============================================================ */
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(async () => {
+    try {
+      const res = await apiGet();
+      if (!res) return;
+      if (res.updatedAt === lastServerUpdatedAt) return;
+      const focused = document.activeElement;
+      if (focused && ['INPUT','TEXTAREA','SELECT'].includes(focused.tagName)) return;
+      state = Object.assign({}, DEFAULT_STATE, res.data);
+      lastServerUpdatedAt = res.updatedAt;
+      saveLocal();
+      render();
+      log('polled new data');
+    } catch (e) { log('poll fail', e); }
+  }, POLL_INTERVAL);
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+/* ============================================================
+   AUTH
+   ============================================================ */
+async function doLogin(username, password) {
+  if (!username || !password) return { ok: false, error: 'Enter username and password' };
+  const user = state.users.find(u => u.username.toLowerCase() === username.toLowerCase().trim());
+  if (!user) return { ok: false, error: 'Account not found' };
+  const ok = await verifyHash(password, user.passwordHash);
+  if (!ok) return { ok: false, error: 'Incorrect password' };
+  if (!/^[a-f0-9]{64}$/.test(user.passwordHash)) {
+    user.passwordHash = await newHash(password);
+  }
+  updateStreak(user.id);
+  await save();
+  setSession(user.username);
+  return { ok: true, user };
+}
+
+async function doRegister(form) {
+  if (!form.name || !form.username || !form.password) return { ok: false, error: 'Fill all required fields' };
+  if (state.users.find(u => u.username.toLowerCase() === form.username.toLowerCase())) return { ok: false, error: 'Username taken' };
+  if (form.password.length < 6) return { ok: false, error: 'Password must be 6+ chars' };
+  const hash = await newHash(form.password);
+  const user = {
+    id: uid(),
+    username: form.username.trim(),
+    passwordHash: hash,
+    name: form.name.trim(),
+    role: 'parent',
+    phone: form.phone || '',
+    email: form.email || '',
+    joinedAt: new Date().toISOString(),
+    membershipStatus: 'active',
+    streak: 1,
+    lastLoginDate: todayStr()
+  };
+  state.users.push(user);
+  addPoints(user.id, 10);
+  state.notifications.push({
+    id: uid(), userId: user.id,
+    title: 'Welcome to Madhi!', body: 'Your account is ready. Start your admission application.',
+    read: false, at: new Date().toISOString()
+  });
+  await save();
+  setSession(user.username);
+  return { ok: true, user };
+}
+
+function logout() {
+  clearSession();
+  navigate('landing');
+}
+
+/* ============================================================
+   GAMIFICATION
+   ============================================================ */
+function addPoints(userId, amount) {
+  state.points[userId] = (state.points[userId] || 0) + amount;
+  checkBadges(userId);
+}
+
+function unlockBadge(userId, badgeId) {
+  const earned = state.badges[userId] || (state.badges[userId] = []);
+  if (earned.includes(badgeId)) return;
+  earned.push(badgeId);
+  addPoints(userId, 50);
+  const badge = BADGES.find(b => b.id === badgeId);
+  state.notifications.push({
+    id: uid(), userId,
+    title: 'Badge unlocked! 🎉',
+    body: badge ? badge.name : badgeId,
+    read: false, at: new Date().toISOString()
+  });
+}
+
+function checkBadges(userId) {
+  const pts = state.points[userId] || 0;
+  const user = state.users.find(u => u.id === userId);
+  const earned = state.badges[userId] || (state.badges[userId] = []);
+  const appForUser = state.applications.filter(a => a.parentId === userId);
+  const payForUser = state.payments.filter(p => p.parentId === userId);
+  if (user && user.role === 'parent' && user.phone && user.email) unlockBadge(userId, 'profile_pro');
+  if (appForUser.length > 0) unlockBadge(userId, 'applicant');
+  if (payForUser.some(p => p.status === 'approved')) unlockBadge(userId, 'paid_up');
+  if (appForUser.some(a => a.status === 'approved')) unlockBadge(userId, 'approved');
+  if (user && user.streak >= 3) unlockBadge(userId, 'streak_3');
+  if (user && user.streak >= 7) unlockBadge(userId, 'streak_7');
+  if (user && user.streak >= 30) unlockBadge(userId, 'streak_30');
+  if (pts >= 100) unlockBadge(userId, 'pts_100');
+  if (pts >= 500) unlockBadge(userId, 'pts_500');
+  const firstApp = appForUser[0];
+  if (user && firstApp) {
+    const days = (new Date(firstApp.createdAt) - new Date(user.joinedAt)) / 86400000;
+    if (days <= 7) unlockBadge(userId, 'early');
+  }
+  if (user && user.referredBy) unlockBadge(userId, 'referrer');
+}
+
+function updateStreak(userId) {
+  const user = state.users.find(u => u.id === userId);
+  if (!user) return;
+  const today = todayStr();
+  if (user.lastLoginDate === today) return;
+  if (user.lastLoginDate === yesterdayStr()) user.streak = (user.streak || 0) + 1;
+  else user.streak = 1;
+  user.lastLoginDate = today;
+  addPoints(userId, 10);
+}
+
+/* ============================================================
+   APPLICATIONS & PAYMENTS
+   ============================================================ */
+async function submitApplication(data) {
+  if (!currentUser) return { ok: false, error: 'Login required' };
+  const app = {
+    id: uid(),
+    parentId: currentUser.id,
+    parentName: currentUser.name,
+    parentPhone: currentUser.phone,
+    studentName: data.studentName,
+    dob: data.dob,
+    gender: data.gender,
+    grade: data.grade,
+    previousSchool: data.previousSchool || '',
+    address: data.address,
+    status: 'pending_payment',
+    createdAt: new Date().toISOString(),
+    reference: 'MAD-' + Date.now().toString(36).toUpperCase().slice(-6)
+  };
+  state.applications.push(app);
+  addPoints(currentUser.id, 15);
+  state.notifications.push({
+    id: uid(), userId: currentUser.id,
+    title: 'Application created',
+    body: 'Reference ' + app.reference + '. Pay the fee to continue.',
+    read: false, at: new Date().toISOString()
+  });
+  await save();
+  return { ok: true, app };
+}
+
+async function markPaid(applicationId) {
+  const app = state.applications.find(a => a.id === applicationId);
+  if (!app) return { ok: false };
+  if (app.status !== 'pending_payment') return { ok: false, error: 'Invalid status' };
+  app.status = 'payment_review';
+  state.payments.push({
+    id: uid(), applicationId, parentId: app.parentId,
+    amount: state.settings.applicationFee, method: 'UPI',
+    status: 'pending', at: new Date().toISOString()
+  });
+  state.notifications.push({
+    id: uid(), userId: app.parentId,
+    title: 'Payment under review',
+    body: 'Your payment for ' + app.studentName + ' is being verified.',
+    read: false, at: new Date().toISOString()
+  });
+  await save();
+  return { ok: true };
+}
+
+async function approveApp(applicationId) {
+  const app = state.applications.find(a => a.id === applicationId);
+  if (!app) return { ok: false };
+  app.status = 'approved';
+  app.approvedAt = new Date().toISOString();
+  state.payments.filter(p => p.applicationId === applicationId && p.status === 'pending').forEach(p => p.status = 'approved');
+  addPoints(app.parentId, 25);
+  state.notifications.push({
+    id: uid(), userId: app.parentId,
+    title: 'Admission Approved! 🎉',
+    body: app.studentName + ' has been admitted to Madhi School.',
+    read: false, at: new Date().toISOString()
+  });
+  await save();
+  return { ok: true };
+}
+
+async function rejectApp(applicationId, reason) {
+  const app = state.applications.find(a => a.id === applicationId);
+  if (!app) return { ok: false };
+  app.status = 'rejected';
+  app.reason = reason || '';
+  state.payments.filter(p => p.applicationId === applicationId && p.status === 'pending').forEach(p => p.status = 'refunded');
+  state.notifications.push({
+    id: uid(), userId: app.parentId,
+    title: 'Application update',
+    body: 'Application not approved. ' + (reason || ''),
+    read: false, at: new Date().toISOString()
+  });
+  await save();
+  return { ok: true };
+}
+
+async function placeOrder(itemId) {
+  if (!currentUser) return { ok: false };
+  const item = STORE_ITEMS.find(i => i.id === itemId);
+  if (!item) return { ok: false };
+  state.orders.push({
+    id: uid(), userId: currentUser.id, itemId, itemName: item.name,
+    price: item.price, status: 'pending', at: new Date().toISOString()
+  });
+  state.notifications.push({
+    id: uid(), userId: currentUser.id,
+    title: 'Order placed',
+    body: item.name + ' - ' + fmtINR(item.price),
+    read: false, at: new Date().toISOString()
+  });
+  await save();
+  return { ok: true };
+}
+
+async function updateOrderStatus(orderId, newStatus) {
+  const order = state.orders.find(o => o.id === orderId);
+  if (!order) return { ok: false };
+  order.status = newStatus;
+  await save();
+  return { ok: true };
+}
+
+/* ============================================================
+   DERIVED DATA
+   ============================================================ */
+function notificationsFor(userId) {
+  return state.notifications.filter(n => n.userId === userId).sort((a, b) => new Date(b.at) - new Date(a.at));
+}
+
+function unreadCount(userId) {
+  return state.notifications.filter(n => n.userId === userId && !n.read).length;
+}
+
+function appsFor(userId) {
+  return state.applications.filter(a => a.parentId === userId).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+function paymentsFor(userId) {
+  return state.payments.filter(p => p.parentId === userId).sort((a, b) => new Date(b.at) - new Date(a.at));
+}
+
+function ordersFor(userId) {
+  return state.orders.filter(o => o.userId === userId).sort((a, b) => new Date(b.at) - new Date(a.at));
+}
+
+function totalRevenue() {
+  return state.payments.filter(p => p.status === 'approved').reduce((s, p) => s + (p.amount || 0), 0);
+}
+
+function totalExpenses() {
+  return state.expenses.reduce((s, e) => s + (e.amount || 0), 0);
+}
+
+function revenueByMonth() {
+  const now = new Date();
+  const buckets = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    buckets.push({ year: d.getFullYear(), month: d.getMonth(), total: 0, label: d.toLocaleString('en-IN', { month: 'short' }) });
+  }
+  state.payments.filter(p => p.status === 'approved').forEach(p => {
+    const d = new Date(p.at);
+    const b = buckets.find(b => b.year === d.getFullYear() && b.month === d.getMonth());
+    if (b) b.total += p.amount || 0;
+  });
+  return buckets;
+}
+
+function leaderboard() {
+  const arr = Object.entries(state.points || {}).map(([userId, pts]) => {
+    const u = state.users.find(x => x.id === userId);
+    return { userId, pts, name: u ? u.name : 'Unknown', role: u ? u.role : '' };
+  });
+  return arr.filter(x => x.role === 'parent').sort((a, b) => b.pts - a.pts).slice(0, 10);
+}
+
+/* ============================================================
+   RENDER
+   ============================================================ */
+function app() { return document.getElementById('app'); }
+
+function navigate(view) {
+  currentView = view;
+  render();
+  window.scrollTo({ top: 0, behavior: 'instant' });
+}
+
+function render() {
+  const root = app();
+  if (!root) return;
+  const focused = document.activeElement;
+  const isTyping = focused && ['INPUT','TEXTAREA','SELECT'].includes(focused.tagName);
+  if (isTyping && root.dataset.view === currentView + ':' + (currentUser ? currentUser.id : 'guest')) return;
+  root.dataset.view = currentView + ':' + (currentUser ? currentUser.id : 'guest');
+
+  let html = '';
+  if (currentUser) {
+    if (currentUser.role === 'owner') html = viewOwner();
+    else html = viewParent();
+    if (currentUser.role === 'owner') startPolling();
+    else stopPolling();
+  } else {
+    if (currentView === 'login') html = viewLogin();
+    else if (currentView === 'register') html = viewRegister();
+    else if (currentView === 'status') html = viewStatus();
+    else html = viewLanding();
+    stopPolling();
+  }
+  root.innerHTML = html + '<div id="toast" class="toast"></div>';
+  attachEvents();
+  if (currentView === 'apply' && currentUser) mountApplyWizard();
+  if (currentUser && currentUser.role === 'parent' && document.getElementById('upi-qr')) mountUPIQR();
+}
+
+/* ============================================================
+   NAVBAR
+   ============================================================ */
+function navbar() {
+  const brand = `<a class="navbar__brand" href="#" data-nav="landing"><span class="navbar__logo">M</span><span>Madhi</span></a>`;
+  if (currentUser) {
+    const isOwner = currentUser.role === 'owner';
+    return `<nav class="navbar"><div class="container navbar__inner">
+      ${brand}
+      <ul class="navbar__menu">
+        ${isOwner
+          ? `<li><a class="navbar__link" href="#" data-nav="owner_dash">Dashboard</a></li>
+             <li><a class="navbar__link" href="#" data-nav="owner_apps">Applications</a></li>
+             <li><a class="navbar__link" href="#" data-nav="owner_members">Members</a></li>
+             <li><a class="navbar__link" href="#" data-nav="owner_finance">Finance</a></li>`
+          : `<li><a class="navbar__link" href="#" data-nav="parent_dash">Home</a></li>
+             <li><a class="navbar__link" href="#" data-nav="parent_apply">New Application</a></li>
+             <li><a class="navbar__link" href="#" data-nav="parent_orders">My Orders</a></li>
+             <li><a class="navbar__link" href="#" data-nav="parent_profile">Profile</a></li>`}
+      </ul>
+      <div class="navbar__actions">
+        <span class="pill pill--muted">${escapeHTML(currentUser.name)}</span>
+        <button class="btn btn--ghost btn--sm" data-action="logout">Logout</button>
+        <button class="navbar__toggle" data-action="toggle-menu">☰</button>
+      </div>
+    </div></nav>`;
+  }
+  return `<nav class="navbar"><div class="container navbar__inner">
+    ${brand}
+    <ul class="navbar__menu">
+      <li><a class="navbar__link" href="#" data-nav="landing">Home</a></li>
+      <li><a class="navbar__link" href="#" data-nav="status">Check Status</a></li>
+      <li><a class="navbar__link" href="#" data-nav="login">Login</a></li>
+    </ul>
+    <div class="navbar__actions">
+      <a href="#" class="btn btn--primary btn--sm" data-nav="register">Apply Now</a>
+      <button class="navbar__toggle" data-action="toggle-menu">☰</button>
+    </div>
+  </div></nav>`;
+}
+
+/* ============================================================
+   LANDING
+   ============================================================ */
+function viewLanding() {
+  return `
+  ${navbar()}
+  <section class="hero">
+    <div class="container hero__grid">
+      <div>
+        <span class="hero__label">Admissions Open 2026-27</span>
+        <h1 class="hero__title">Welcome to <span>Madhi</span><br>School Admission Portal</h1>
+        <p class="hero__desc">Apply online, track your application status, and pay fees securely — all in one place. Excellence in education since day one.</p>
+        <div class="hero__actions">
+          <a href="#" class="btn btn--primary btn--lg" data-nav="register">New Registration</a>
+          <a href="#" class="btn btn--outline btn--lg" data-nav="status">Check Status</a>
+        </div>
+      </div>
+      <div class="hero__media">
+        <div style="width:100%;height:100%;display:grid;place-items:center;background:linear-gradient(135deg,#2563EB,#0B2D5C);color:#fff;font-size:120px">🎓</div>
+      </div>
+    </div>
+  </section>
+  <section class="section">
+    <div class="container">
+      <h2 class="section__title">Why Madhi?</h2>
+      <p class="section__subtitle">A modern admission experience built for parents and students</p>
+      <div class="features">
+        <div class="feature-card"><div class="feature-card__icon">📝</div><h3>Simple Application</h3><p>Multi-step form that saves as you go — no lost data.</p></div>
+        <div class="feature-card"><div class="feature-card__icon feature-card__icon--gold">💳</div><h3>Secure Payment</h3><p>Pay the application fee via UPI in seconds.</p></div>
+        <div class="feature-card"><div class="feature-card__icon">📊</div><h3>Live Tracking</h3><p>Check your application status any time — real-time updates.</p></div>
+        <div class="feature-card"><div class="feature-card__icon feature-card__icon--gold">🎉</div><h3>Earn Rewards</h3><p>Complete steps, earn badges, climb the leaderboard.</p></div>
+      </div>
+    </div>
+  </section>
+  ${footer()}`;
+}
+
+/* ============================================================
+   LOGIN
+   ============================================================ */
+function viewLogin() {
+  return `
+  ${navbar()}
+  <div class="login-page">
+    <div class="login-card">
+      <div class="login-card__head">
+        <div class="login-card__icon">🔐</div>
+        <h2 class="login-card__title">Welcome Back</h2>
+        <p class="login-card__sub">Login to your Madhi account</p>
+      </div>
+      <form id="login-form">
+        <div class="form-group mb-4">
+          <label class="form-label">Username <span class="required">*</span></label>
+          <input class="form-input" name="username" autocomplete="username" required>
+        </div>
+        <div class="form-group mb-4">
+          <label class="form-label">Password <span class="required">*</span></label>
+          <input class="form-input" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button class="btn btn--primary btn--block btn--lg" type="submit" id="login-btn">Login</button>
+        <p class="form-error mt-2" id="login-error" style="display:none"></p>
+      </form>
+      <p class="login-foot">
+        New here? <a href="#" data-nav="register">Create an account</a><br>
+        <span class="text-muted" style="font-size:12px">Owner default: owner / owner123</span>
+      </p>
+    </div>
+  </div>
+  ${footer()}`;
+}
+
+/* ============================================================
+   REGISTER
+   ============================================================ */
+function viewRegister() {
+  return `
+  ${navbar()}
+  <div class="login-page">
+    <div class="login-card">
+      <div class="login-card__head">
+        <div class="login-card__icon">✨</div>
+        <h2 class="login-card__title">Create Account</h2>
+        <p class="login-card__sub">Register to apply for admission</p>
+      </div>
+      <form id="register-form">
+        <div class="form-group mb-4">
+          <label class="form-label">Full Name <span class="required">*</span></label>
+          <input class="form-input" name="name" required>
+        </div>
+        <div class="form-group mb-4">
+          <label class="form-label">Username <span class="required">*</span></label>
+          <input class="form-input" name="username" autocomplete="username" required>
+        </div>
+        <div class="form-row form-row--2 mb-4">
+          <div class="form-group">
+            <label class="form-label">Phone</label>
+            <input class="form-input" name="phone" type="tel" pattern="[0-9+ -]{8,15}">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Email</label>
+            <input class="form-input" name="email" type="email">
+          </div>
+        </div>
+        <div class="form-group mb-4">
+          <label class="form-label">Password <span class="required">*</span></label>
+          <input class="form-input" name="password" type="password" minlength="6" autocomplete="new-password" required>
+          <span class="form-hint">Minimum 6 characters</span>
+        </div>
+        <button class="btn btn--primary btn--block btn--lg" type="submit" id="register-btn">Create Account</button>
+        <p class="form-error mt-2" id="register-error" style="display:none"></p>
+      </form>
+      <p class="login-foot">Already have an account? <a href="#" data-nav="login">Login</a></p>
+    </div>
+  </div>
+  ${footer()}`;
+}
+
+/* ============================================================
+   STATUS PAGE (public lookup)
+   ============================================================ */
+function viewStatus() {
+  return `
+  ${navbar()}
+  <section class="status-page">
+    <div class="container status-shell">
+      <div class="status-search">
+        <h2 class="card__title">Check Application Status</h2>
+        <p class="card__subtitle">Enter your reference number to view status</p>
+        <form class="status-search__form" id="status-form">
+          <input class="form-input" name="reference" placeholder="e.g. MAD-ABC123" required>
+          <button class="btn btn--primary" type="submit">Check</button>
+        </form>
+      </div>
+      <div id="status-result"></div>
+    </div>
+  </section>
+  ${footer()}`;
+}
+
+/* ============================================================
+   PARENT DASHBOARD
+   ============================================================ */
+function viewParent() {
+  const userId = currentUser.id;
+  const apps = appsFor(userId);
+  const points = state.points[userId] || 0;
+  const badges = state.badges[userId] || [];
+  const streak = currentUser.streak || 0;
+  const notifs = notificationsFor(userId);
+  const unread = unreadCount(userId);
+
+  let sub = currentView.startsWith('parent_') ? currentView : 'parent_dash';
+
+  return `
+  ${navbar()}
+  <section class="section" style="padding-top:32px">
+    <div class="container">
+      <div class="flex-between mb-4">
+        <div>
+          <h1 style="font-size:28px;margin:0">Hi, ${escapeHTML(currentUser.name)} 👋</h1>
+          <p class="text-muted" style="margin:4px 0 0;font-size:14px">Student Parent · Madhi School</p>
+        </div>
+        <div class="flex gap-2">
+          <span class="pill pill--info">🔥 ${streak} day streak</span>
+          <span class="pill pill--warning">⭐ ${points} pts</span>
+        </div>
+      </div>
+      <div class="features" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
+        <div class="feature-card"><div class="feature-card__icon">📝</div><h3>${apps.length}</h3><p>Applications</p></div>
+        <div class="feature-card"><div class="feature-card__icon feature-card__icon--gold">⭐</div><h3>${points}</h3><p>Total Points</p></div>
+        <div class="feature-card"><div class="feature-card__icon">🏅</div><h3>${badges.length} / ${BADGES.length}</h3><p>Badges Earned</p></div>
+        <div class="feature-card"><div class="feature-card__icon feature-card__icon--gold">🔔</div><h3>${unread}</h3><p>Unread Alerts</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="container" style="padding-bottom:32px">
+    <div class="flex gap-2 mb-4" style="flex-wrap:wrap">
+      <button class="btn ${sub==='parent_dash'?'btn--primary':'btn--outline'} btn--sm" data-nav="parent_dash">Overview</button>
+      <button class="btn ${sub==='parent_apply'?'btn--primary':'btn--outline'} btn--sm" data-nav="parent_apply">New Application</button>
+      <button class="btn ${sub==='parent_orders'?'btn--primary':'btn--outline'} btn--sm" data-nav="parent_orders">Store</button>
+      <button class="btn ${sub==='parent_badges'?'btn--primary':'btn--outline'} btn--sm" data-nav="parent_badges">Badges</button>
+      <button class="btn ${sub==='parent_notifs'?'btn--primary':'btn--outline'} btn--sm" data-nav="parent_notifs">Notifications ${unread?'('+unread+')':''}</button>
+      <button class="btn ${sub==='parent_profile'?'btn--primary':'btn--outline'} btn--sm" data-nav="parent_profile">Profile</button>
+    </div>
+
+    ${sub==='parent_apply' ? parentApplyForm() : ''}
+    ${sub==='parent_orders' ? parentStore() : ''}
+    ${sub==='parent_badges' ? parentBadges() : ''}
+    ${sub==='parent_notifs' ? parentNotifs(notifs) : ''}
+    ${sub==='parent_profile' ? parentProfile() : ''}
+    ${sub==='parent_dash' ? parentOverview(apps) : ''}
+  </section>
+  ${footer()}`;
+}
+
+function parentOverview(apps) {
+  const latest = apps[0];
+  return `
+  <div class="card mb-4">
+    <h3 class="card__title">My Applications</h3>
+    ${apps.length === 0 ? `
+      <div class="alert alert--info">No applications yet. Click <strong>New Application</strong> to start.</div>
+    ` : `
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Reference</th><th>Student</th><th>Grade</th><th>Status</th><th>Submitted</th><th></th></tr></thead>
+        <tbody>
+          ${apps.map(a => `
+            <tr>
+              <td data-label="Reference"><strong>${escapeHTML(a.reference)}</strong></td>
+              <td data-label="Student">${escapeHTML(a.studentName)}</td>
+              <td data-label="Grade">${escapeHTML(a.grade)}</td>
+              <td data-label="Status">${statusPill(a.status)}</td>
+              <td data-label="Submitted">${fmtDate(a.createdAt)}</td>
+              <td data-label=""><button class="btn btn--outline btn--sm" data-action="view-app" data-id="${a.id}">View</button></td>
+            </tr>`).join('')}
+        </tbody>
+      </table></div>
+    `}
+  </div>
+  ${latest && latest.status === 'pending_payment' ? `
+  <div class="card mb-4">
+    <h3 class="card__title">Complete Payment</h3>
+    <p class="card__subtitle">Application ${escapeHTML(latest.reference)} — ${escapeHTML(latest.studentName)}</p>
+    <div class="detail-grid detail-grid--2">
+      <div class="detail-item"><span class="detail-item__label">Fee</span><span class="detail-item__value">${fmtINR(state.settings.applicationFee)}</span></div>
+      <div class="detail-item"><span class="detail-item__label">UPI ID</span><span class="detail-item__value">${escapeHTML(state.settings.upiId)}</span></div>
+    </div>
+    <div class="flex gap-2 mt-4" style="flex-wrap:wrap">
+      <button class="btn btn--primary" data-action="open-pay" data-id="${latest.id}">Pay Now</button>
+    </div>
+  </div>` : ''}
+  ${latest && latest.status === 'payment_review' ? `
+  <div class="card mb-4" style="text-align:center">
+    <div style="font-size:48px;margin-bottom:8px">⏳</div>
+    <h3 class="card__title">Payment Under Review</h3>
+    <p class="card__subtitle">Your payment for <strong>${escapeHTML(latest.studentName)}</strong> is being verified by the school admin.</p>
+    <button class="btn btn--outline" data-action="refresh-status">Refresh Status</button>
+  </div>` : ''}
+  ${latest && latest.status === 'approved' ? `
+  <div class="card mb-4" style="text-align:center;background:linear-gradient(135deg,#DCFCE7,#F0FDF4)">
+    <div style="font-size:48px;margin-bottom:8px">🎉</div>
+    <h3 class="card__title" style="color:#065F46">Admission Approved!</h3>
+    <p style="color:#065F46;margin:0"><strong>${escapeHTML(latest.studentName)}</strong> is officially admitted to Madhi School.</p>
+  </div>` : ''}
+  ${latest && latest.status === 'rejected' ? `
+  <div class="alert alert--danger"><strong>Application Rejected:</strong> ${escapeHTML(latest.reason || 'Contact the school office for details.')}</div>` : ''}`;
+}
+
+function parentApplyForm() {
+  return `
+  <div class="form-shell">
+    <div class="progress" id="apply-progress">
+      ${[1,2,3,4].map(i => `<div class="progress__step" data-step="${i}"><div class="progress__num">${i}</div><div class="progress__label">${
+        ['Student','Details','Review','Pay'][i-1]
+      }</div></div>`).join('')}
+    </div>
+    <form id="apply-form">
+      <div data-step="1">
+        <h3 class="form-step__title">Student Information</h3>
+        <p class="form-step__desc">Tell us about the student.</p>
+        <div class="form-row form-row--2">
+          <div class="form-group"><label class="form-label">Student Full Name <span class="required">*</span></label><input class="form-input" name="studentName" required></div>
+          <div class="form-group"><label class="form-label">Date of Birth <span class="required">*</span></label><input class="form-input" name="dob" type="date" required></div>
+        </div>
+        <div class="form-row form-row--2">
+          <div class="form-group"><label class="form-label">Gender <span class="required">*</span></label>
+            <select class="form-select" name="gender" required><option value="">Select</option><option>Male</option><option>Female</option><option>Other</option></select>
+          </div>
+          <div class="form-group"><label class="form-label">Grade Applying For <span class="required">*</span></label>
+            <select class="form-select" name="grade" required>
+              <option value="">Select</option>
+              <option>LKG</option><option>UKG</option>
+              ${[1,2,3,4,5,6,7,8,9,10,11,12].map(g=>`<option>Grade ${g}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+      </div>
+      <div data-step="2" style="display:none">
+        <h3 class="form-step__title">Additional Details</h3>
+        <p class="form-step__desc">Optional, but helps us process faster.</p>
+        <div class="form-group mb-4"><label class="form-label">Previous School</label><input class="form-input" name="previousSchool"></div>
+        <div class="form-group mb-4"><label class="form-label">Home Address <span class="required">*</span></label><textarea class="form-textarea" name="address" required></textarea></div>
+      </div>
+      <div data-step="3" style="display:none">
+        <h3 class="form-step__title">Review</h3>
+        <p class="form-step__desc">Verify before submitting.</p>
+        <div class="alert alert--info" id="apply-review"></div>
+      </div>
+      <div data-step="4" style="display:none">
+        <h3 class="form-step__title">Fee Payment</h3>
+        <p class="form-step__desc">Pay the application fee to complete.</p>
+        <div class="detail-grid detail-grid--2">
+          <div class="detail-item"><span class="detail-item__label">Amount</span><span class="detail-item__value">${fmtINR(state.settings.applicationFee)}</span></div>
+          <div class="detail-item"><span class="detail-item__label">UPI ID</span><span class="detail-item__value">${escapeHTML(state.settings.upiId)}</span></div>
+        </div>
+        <p class="mt-4 text-muted" style="font-size:14px">Application reference will be generated on submit. Payment verification requires admin approval.</p>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn btn--outline" data-action="apply-prev" style="display:none">Back</button>
+        <button type="button" class="btn btn--primary" data-action="apply-next">Continue</button>
+      </div>
+    </form>
+  </div>`;
+}
+
+function parentStore() {
+  const myOrders = ordersFor(currentUser.id);
+  return `
+  <div class="card mb-4">
+    <h3 class="card__title">Madhi School Store</h3>
+    <p class="card__subtitle">Optional items for enrolled students</p>
+    <div class="features" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
+      ${STORE_ITEMS.map(i => `
+        <div class="feature-card">
+          <div style="font-size:42px;margin-bottom:8px">${i.icon}</div>
+          <h4 style="margin:0 0 4px">${i.name}</h4>
+          <p style="font-size:13px;margin:0 0 8px">${i.desc}</p>
+          <div class="flex gap-2" style="align-items:center">
+            <span style="font-weight:700;color:var(--primary)">${fmtINR(i.price)}</span>
+            <span style="text-decoration:line-through;color:#94A3B8;font-size:13px">${fmtINR(i.mrp)}</span>
+          </div>
+          <button class="btn btn--primary btn--sm mt-2" data-action="order" data-id="${i.id}">Order Now</button>
+        </div>
+      `).join('')}
+    </div>
+  </div>
+  <div class="card">
+    <h3 class="card__title">My Orders</h3>
+    ${myOrders.length === 0 ? '<p class="text-muted">No orders yet.</p>' : `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Item</th><th>Price</th><th>Status</th><th>Date</th></tr></thead>
+      <tbody>${myOrders.map(o => `
+        <tr><td data-label="Item">${escapeHTML(o.itemName)}</td>
+            <td data-label="Price">${fmtINR(o.price)}</td>
+            <td data-label="Status">${orderPill(o.status)}</td>
+            <td data-label="Date">${fmtDate(o.at)}</td></tr>`).join('')}
+      </tbody></table></div>`}
+  </div>`;
+}
+
+function parentBadges() {
+  const earned = state.badges[currentUser.id] || [];
+  return `<div class="card">
+    <h3 class="card__title">Achievements (${earned.length}/${BADGES.length})</h3>
+    <p class="card__subtitle">Unlock badges by completing milestones</p>
+    <div class="features" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr))">
+      ${BADGES.map(b => {
+        const got = earned.includes(b.id);
+        return `<div class="feature-card" style="text-align:center;${got?'border-color:#FFB81C':''}">
+          <div style="font-size:42px;margin-bottom:8px;${got?'':'filter:grayscale(1);opacity:.35'}">${b.icon}</div>
+          <h4 style="margin:0 0 4px">${b.name}</h4>
+          <p style="font-size:12px;margin:0">${b.desc}</p>
+          ${got ? '<span class="pill pill--success mt-2">Unlocked</span>' : ''}
+        </div>`;
+      }).join('')}
+    </div>
+  </div>`;
+}
+
+function parentNotifs(notifs) {
+  return `<div class="card">
+    <h3 class="card__title">Notifications</h3>
+    <p class="card__subtitle">${notifs.filter(n=>!n.read).length} unread</p>
+    ${notifs.length === 0 ? '<p class="text-muted">No notifications yet.</p>' : notifs.map(n => `
+      <div class="alert ${n.read?'alert--info':'alert--warning'}" style="margin-bottom:8px">
+        <div style="flex:1">
+          <strong>${escapeHTML(n.title)}</strong><br>
+          <span style="font-size:13px">${escapeHTML(n.body)}</span><br>
+          <span style="font-size:11px;opacity:.7">${fmtDateTime(n.at)}</span>
+        </div>
+        ${!n.read ? `<button class="btn btn--sm btn--outline" data-action="mark-read" data-id="${n.id}">Mark read</button>` : ''}
+      </div>`).join('')}
+    <button class="btn btn--outline btn--sm mt-4" data-action="mark-all-read">Mark all as read</button>
+  </div>`;
+}
+
+function parentProfile() {
+  const u = currentUser;
+  return `<div class="card">
+    <div class="flex-between mb-4">
+      <h3 class="card__title" style="margin:0">My Profile</h3>
+      <span class="pill pill--success">${escapeHTML(u.role)}</span>
+    </div>
+    <div class="flex gap-4 mb-4" style="flex-wrap:wrap;align-items:center">
+      <div style="width:80px;height:80px;border-radius:50%;background:${u.avatar?'transparent':'linear-gradient(135deg,#2563EB,#0B2D5C)'};display:grid;place-items:center;color:#fff;font-size:28px;font-weight:700;overflow:hidden">
+        ${u.avatar ? `<img src="${u.avatar}" style="width:100%;height:100%;object-fit:cover">` : escapeHTML(u.name.charAt(0).toUpperCase())}
+      </div>
+      <div>
+        <div style="font-weight:700">${escapeHTML(u.name)}</div>
+        <div class="text-muted" style="font-size:14px">@${escapeHTML(u.username)}</div>
+      </div>
+      <label class="btn btn--outline btn--sm" style="cursor:pointer">
+        Change Photo
+        <input type="file" accept="image/*" style="display:none" id="avatar-input">
+      </label>
+    </div>
+    <div class="detail-grid detail-grid--2">
+      <div class="detail-item"><span class="detail-item__label">Phone</span><span class="detail-item__value">${escapeHTML(u.phone||'—')}</span></div>
+      <div class="detail-item"><span class="detail-item__label">Email</span><span class="detail-item__value">${escapeHTML(u.email||'—')}</span></div>
+      <div class="detail-item"><span class="detail-item__label">Joined</span><span class="detail-item__value">${fmtDate(u.joinedAt)}</span></div>
+      <div class="detail-item"><span class="detail-item__label">Points</span><span class="detail-item__value">${state.points[u.id]||0}</span></div>
+      <div class="detail-item"><span class="detail-item__label">Streak</span><span class="detail-item__value">${u.streak||0} days</span></div>
+      <div class="detail-item"><span class="detail-item__label">Status</span><span class="detail-item__value">${escapeHTML(u.membershipStatus)}</span></div>
+    </div>
+  </div>`;
+}
+
+/* ============================================================
+   OWNER DASHBOARD
+   ============================================================ */
+function viewOwner() {
+  const totalParents = state.users.filter(u => u.role === 'parent').length;
+  const totalApps = state.applications.length;
+  const approved = state.applications.filter(a => a.status === 'approved').length;
+  const pending = state.applications.filter(a => ['pending_payment','payment_review'].includes(a.status)).length;
+  const revenue = totalRevenue();
+  const expenses = totalExpenses();
+  const profit = revenue - expenses;
+
+  let sub = currentView.startsWith('owner_') ? currentView : 'owner_dash';
+
+  return `
+  ${navbar()}
+  <section class="section" style="padding-top:32px">
+    <div class="container">
+      <div class="flex-between mb-4">
+        <div>
+          <h1 style="font-size:28px;margin:0">Owner Dashboard</h1>
+          <p class="text-muted" style="margin:4px 0 0;font-size:14px">Madhi School Administration</p>
+        </div>
+        <span class="pill pill--success"><span style="display:inline-block;width:8px;height:8px;background:currentColor;border-radius:50%;animation:pulse 1.5s infinite"></span> Live</span>
+      </div>
+      <div class="features" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr))">
+        <div class="feature-card"><div class="feature-card__icon">👥</div><h3>${totalParents}</h3><p>Registered Parents</p></div>
+        <div class="feature-card"><div class="feature-card__icon feature-card__icon--gold">📝</div><h3>${totalApps}</h3><p>Total Applications</p></div>
+        <div class="feature-card"><div class="feature-card__icon">✅</div><h3>${approved}</h3><p>Approved</p></div>
+        <div class="feature-card"><div class="feature-card__icon feature-card__icon--gold">⏳</div><h3>${pending}</h3><p>Pending</p></div>
+        <div class="feature-card"><div class="feature-card__icon">💰</div><h3>${fmtINR(revenue)}</h3><p>Revenue</p></div>
+        <div class="feature-card"><div class="feature-card__icon feature-card__icon--gold">💸</div><h3>${fmtINR(expenses)}</h3><p>Expenses</p></div>
+        <div class="feature-card"><div class="feature-card__icon">📈</div><h3>${fmtINR(profit)}</h3><p>Profit</p></div>
+      </div>
+    </div>
+  </section>
+  <section class="container" style="padding-bottom:32px">
+    <div class="flex gap-2 mb-4" style="flex-wrap:wrap">
+      <button class="btn ${sub==='owner_dash'?'btn--primary':'btn--outline'} btn--sm" data-nav="owner_dash">Overview</button>
+      <button class="btn ${sub==='owner_apps'?'btn--primary':'btn--outline'} btn--sm" data-nav="owner_apps">Applications</button>
+      <button class="btn ${sub==='owner_members'?'btn--primary':'btn--outline'} btn--sm" data-nav="owner_members">Members</button>
+      <button class="btn ${sub==='owner_finance'?'btn--primary':'btn--outline'} btn--sm" data-nav="owner_finance">Finance</button>
+      <button class="btn ${sub==='owner_orders'?'btn--primary':'btn--outline'} btn--sm" data-nav="owner_orders">Orders</button>
+      <button class="btn ${sub==='owner_broadcast'?'btn--primary':'btn--outline'} btn--sm" data-nav="owner_broadcast">Broadcast</button>
+      <button class="btn ${sub==='owner_leaderboard'?'btn--primary':'btn--outline'} btn--sm" data-nav="owner_leaderboard">Leaderboard</button>
+    </div>
+    ${sub==='owner_apps' ? ownerApps() : ''}
+    ${sub==='owner_members' ? ownerMembers() : ''}
+    ${sub==='owner_finance' ? ownerFinance() : ''}
+    ${sub==='owner_orders' ? ownerOrders() : ''}
+    ${sub==='owner_broadcast' ? ownerBroadcast() : ''}
+    ${sub==='owner_leaderboard' ? ownerLeaderboard() : ''}
+    ${sub==='owner_dash' ? ownerOverview() : ''}
+  </section>
+  ${footer()}`;
+}
+
+function ownerOverview() {
+  const rev = revenueByMonth();
+  const max = Math.max(1, ...rev.map(r => r.total));
+  const W = 100, H = 100, PAD = 10;
+  return `
+  <div class="card mb-4">
+    <h3 class="card__title">Revenue (Last 6 Months)</h3>
+    <div style="width:100%;height:200px">
+      <svg viewBox="0 0 ${W*6+20} ${H+20}" style="width:100%;height:100%" preserveAspectRatio="none">
+        ${rev.map((r, i) => {
+          const h = (r.total / max) * H;
+          const x = PAD + i * W;
+          const y = H - h + PAD;
+          return `<rect x="${x}" y="${y}" width="${W-10}" height="${h}" fill="url(#grad)" rx="3"/>
+                  <text x="${x+(W-10)/2}" y="${H+15+PAD}" text-anchor="middle" font-size="5" fill="#64748B">${r.label}</text>`;
+        }).join('')}
+        <defs><linearGradient id="grad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2563EB"/><stop offset="1" stop-color="#0B2D5C"/></linearGradient></defs>
+      </svg>
+    </div>
+  </div>
+  <div class="card">
+    <h3 class="card__title">Recent Applications</h3>
+    ${state.applications.length === 0 ? '<p class="text-muted">No applications yet.</p>' : `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Reference</th><th>Student</th><th>Parent</th><th>Grade</th><th>Status</th><th>Submitted</th></tr></thead>
+      <tbody>${state.applications.slice(-8).reverse().map(a => `
+        <tr>
+          <td data-label="Reference">${escapeHTML(a.reference)}</td>
+          <td data-label="Student">${escapeHTML(a.studentName)}</td>
+          <td data-label="Parent">${escapeHTML(a.parentName)}</td>
+          <td data-label="Grade">${escapeHTML(a.grade)}</td>
+          <td data-label="Status">${statusPill(a.status)}</td>
+          <td data-label="Submitted">${fmtDate(a.createdAt)}</td>
+        </tr>`).join('')}
+      </tbody></table></div>`}
+  </div>`;
+}
+
+function ownerApps() {
+  return `
+  <div class="card">
+    <div class="flex-between mb-4">
+      <h3 class="card__title" style="margin:0">All Applications</h3>
+      <input class="form-input" style="max-width:280px" placeholder="Search name / reference / grade" id="app-search">
+    </div>
+    <div id="apps-table-wrap">${ownerAppsTable()}</div>
+  </div>`;
+}
+
+function ownerAppsTable() {
+  const apps = [...state.applications].sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
+  if (apps.length === 0) return '<p class="text-muted">No applications yet.</p>';
+  return `<div class="table-wrap"><table class="table">
+    <thead><tr><th>Ref</th><th>Student</th><th>Parent</th><th>Grade</th><th>Status</th><th>Actions</th></tr></thead>
+    <tbody>${apps.map(a => `
+      <tr data-search="${escapeHTML((a.reference+' '+a.studentName+' '+a.parentName+' '+a.grade).toLowerCase())}">
+        <td data-label="Ref">${escapeHTML(a.reference)}</td>
+        <td data-label="Student">${escapeHTML(a.studentName)}</td>
+        <td data-label="Parent">${escapeHTML(a.parentName)}</td>
+        <td data-label="Grade">${escapeHTML(a.grade)}</td>
+        <td data-label="Status">${statusPill(a.status)}</td>
+        <td data-label="Actions">
+          ${['pending_payment','payment_review'].includes(a.status) ? `
+            <button class="btn btn--sm btn--primary" data-action="approve-app" data-id="${a.id}">Approve</button>
+            <button class="btn btn--sm btn--outline" data-action="reject-app" data-id="${a.id}">Reject</button>
+          ` : `<span class="text-muted" style="font-size:12px">${a.status}</span>`}
+        </td>
+      </tr>`).join('')}
+    </tbody></table></div>`;
+}
+
+function ownerMembers() {
+  const parents = state.users.filter(u => u.role === 'parent');
+  return `<div class="card">
+    <h3 class="card__title">Members (Parents)</h3>
+    <p class="card__subtitle">${parents.length} registered</p>
+    ${parents.length === 0 ? '<p class="text-muted">No parents registered yet.</p>' : `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Name</th><th>Username</th><th>Phone</th><th>Points</th><th>Streak</th><th>Joined</th></tr></thead>
+      <tbody>${parents.map(u => `
+        <tr>
+          <td data-label="Name">${escapeHTML(u.name)}</td>
+          <td data-label="Username">@${escapeHTML(u.username)}</td>
+          <td data-label="Phone">${escapeHTML(u.phone||'—')}</td>
+          <td data-label="Points">${state.points[u.id]||0}</td>
+          <td data-label="Streak">${u.streak||0}d</td>
+          <td data-label="Joined">${fmtDate(u.joinedAt)}</td>
+        </tr>`).join('')}
+      </tbody></table></div>`}
+  </div>`;
+}
+
+function ownerFinance() {
+  const revenue = totalRevenue();
+  const expenses = totalExpenses();
+  return `
+  <div class="card mb-4">
+    <div class="flex-between mb-4">
+      <h3 class="card__title" style="margin:0">Finance</h3>
+      <button class="btn btn--outline btn--sm" data-action="export-backup">Export Backup</button>
+    </div>
+    <div class="detail-grid detail-grid--2 mb-4">
+      <div class="detail-item"><span class="detail-item__label">Revenue</span><span class="detail-item__value text-success">${fmtINR(revenue)}</span></div>
+      <div class="detail-item"><span class="detail-item__label">Expenses</span><span class="detail-item__value text-danger">${fmtINR(expenses)}</span></div>
+      <div class="detail-item"><span class="detail-item__label">Profit</span><span class="detail-item__value" style="font-size:22px;color:${revenue-expenses>=0?'#16A34A':'#DC2626'}">${fmtINR(revenue-expenses)}</span></div>
+    </div>
+    <h4>Add Expense</h4>
+    <form id="expense-form" class="form-row form-row--3">
+      <div class="form-group"><label class="form-label">Category</label>
+        <select class="form-select" name="category" required>
+          <option value="">Select</option>
+          <option>Salaries</option><option>Utilities</option><option>Supplies</option>
+          <option>Maintenance</option><option>Events</option><option>Other</option>
+        </select>
+      </div>
+      <div class="form-group"><label class="form-label">Amount (₹)</label><input class="form-input" name="amount" type="number" min="1" required></div>
+      <div class="form-group"><label class="form-label">Note</label><input class="form-input" name="note"></div>
+      <button class="btn btn--primary" type="submit" style="grid-column:1/-1">Add Expense</button>
+    </form>
+  </div>
+  <div class="card">
+    <h3 class="card__title">Expenses</h3>
+    ${state.expenses.length === 0 ? '<p class="text-muted">No expenses yet.</p>' : `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Category</th><th>Note</th><th>Amount</th><th>Date</th></tr></thead>
+      <tbody>${state.expenses.slice().reverse().map(e => `
+        <tr><td data-label="Category">${escapeHTML(e.category)}</td>
+            <td data-label="Note">${escapeHTML(e.note||'—')}</td>
+            <td data-label="Amount">${fmtINR(e.amount)}</td>
+            <td data-label="Date">${fmtDate(e.at)}</td></tr>`).join('')}
+      </tbody></table></div>`}
+  </div>`;
+}
+
+function ownerOrders() {
+  const orders = [...state.orders].sort((a,b) => new Date(b.at) - new Date(a.at));
+  return `<div class="card">
+    <h3 class="card__title">Store Orders</h3>
+    ${orders.length === 0 ? '<p class="text-muted">No orders yet.</p>' : `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Item</th><th>Parent</th><th>Price</th><th>Status</th><th>Date</th><th>Actions</th></tr></thead>
+      <tbody>${orders.map(o => {
+        const parent = state.users.find(u => u.id === o.userId);
+        return `<tr>
+          <td data-label="Item">${escapeHTML(o.itemName)}</td>
+          <td data-label="Parent">${escapeHTML(parent?parent.name:'—')}</td>
+          <td data-label="Price">${fmtINR(o.price)}</td>
+          <td data-label="Status">${orderPill(o.status)}</td>
+          <td data-label="Date">${fmtDate(o.at)}</td>
+          <td data-label="Actions">
+            ${o.status==='pending'?`<button class="btn btn--sm btn--primary" data-action="order-ready" data-id="${o.id}">Ready</button>`:''}
+            ${o.status==='ready'?`<button class="btn btn--sm btn--primary" data-action="order-delivered" data-id="${o.id}">Delivered</button>`:''}
+          </td>
+        </tr>`;
+      }).join('')}
+      </tbody></table></div>`}
+  </div>`;
+}
+
+function ownerBroadcast() {
+  const anns = [...state.announcements].sort((a,b) => new Date(b.at) - new Date(a.at));
+  return `<div class="card mb-4">
+    <h3 class="card__title">Broadcast Announcement</h3>
+    <form id="broadcast-form">
+      <div class="form-group mb-4"><label class="form-label">Title</label><input class="form-input" name="title" required></div>
+      <div class="form-group mb-4"><label class="form-label">Message</label><textarea class="form-textarea" name="body" required></textarea></div>
+      <button class="btn btn--primary" type="submit">Send to All Parents</button>
+    </form>
+  </div>
+  <div class="card">
+    <h3 class="card__title">Sent Announcements</h3>
+    ${anns.length === 0 ? '<p class="text-muted">None yet.</p>' : anns.map(a => `
+      <div class="alert alert--info mb-4">
+        <div><strong>${escapeHTML(a.title)}</strong><br><span style="font-size:13px">${escapeHTML(a.body)}</span><br><span style="font-size:11px;opacity:.7">${fmtDateTime(a.at)}</span></div>
+      </div>`).join('')}
+  </div>`;
+}
+
+function ownerLeaderboard() {
+  const lb = leaderboard();
+  return `<div class="card">
+    <h3 class="card__title">Top Parents by Points</h3>
+    ${lb.length === 0 ? '<p class="text-muted">No data yet.</p>' : `
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>#</th><th>Name</th><th>Points</th></tr></thead>
+      <tbody>${lb.map((p, i) => `<tr>
+        <td data-label="#">${i+1}</td>
+        <td data-label="Name">${escapeHTML(p.name)}</td>
+        <td data-label="Points">⭐ ${p.pts}</td>
+      </tr>`).join('')}
+      </tbody></table></div>`}
+  </div>`;
+}
+
+/* ============================================================
+   SHARED UI PIECES
+   ============================================================ */
+function statusPill(s) {
+  const map = {
+    pending_payment: ['pill--warning', 'Pending Payment'],
+    payment_review: ['pill--info', 'Under Review'],
+    approved: ['pill--success', 'Approved'],
+    rejected: ['pill--danger', 'Rejected']
+  };
+  const [cls, label] = map[s] || ['pill--muted', s];
+  return `<span class="pill ${cls}">${label}</span>`;
+}
+
+function orderPill(s) {
+  const map = { pending: ['pill--warning', 'Pending'], ready: ['pill--info', 'Ready'], delivered: ['pill--success', 'Delivered'] };
+  const [cls, label] = map[s] || ['pill--muted', s];
+  return `<span class="pill ${cls}">${label}</span>`;
+}
+
+function footer() {
+  return `<footer class="footer">
+    <div class="container">
+      <div class="footer__grid">
+        <div>
+          <div class="footer__brand"><span class="navbar__logo">M</span><span>Madhi School</span></div>
+          <p class="footer__desc">Excellence in education. Online admissions made simple.</p>
+        </div>
+        <div>
+          <h4 class="footer__title">Quick Links</h4>
+          <ul class="footer__list">
+            <li><a href="#" data-nav="landing">Home</a></li>
+            <li><a href="#" data-nav="register">Apply</a></li>
+            <li><a href="#" data-nav="status">Check Status</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4 class="footer__title">Contact</h4>
+          <ul class="footer__list">
+            <li>${escapeHTML(state.settings.phone)}</li>
+            <li>${escapeHTML(state.settings.address)}</li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer__bottom">© ${new Date().getFullYear()} Madhi School. All rights reserved.</div>
+    </div>
+  </footer>`;
+}
+
+/* ============================================================
+   PAYMENT / UPI QR
+   ============================================================ */
+function mountUPIQR() {
+  const el = document.getElementById('upi-qr');
+  if (!el || typeof QRCode === 'undefined') return;
+  el.innerHTML = '';
+  const amount = state.settings.applicationFee;
+  const upi = `upi://pay?pa=${encodeURIComponent(state.settings.upiId)}&pn=Madhi+School&am=${amount}&cu=INR&tn=Admission+Fee`;
+  try { new QRCode(el, { text: upi, width: 200, height: 200 }); } catch (e) { log('qr fail', e); }
+}
+
+/* ============================================================
+   APPLY WIZARD
+   ============================================================ */
+let applyStep = 1;
+function mountApplyWizard() {
+  applyStep = 1;
+  updateApplyStep();
+}
+
+function updateApplyStep() {
+  const form = document.getElementById('apply-form');
+  if (!form) return;
+  form.querySelectorAll('[data-step]').forEach(el => {
+    el.style.display = parseInt(el.dataset.step) === applyStep ? '' : 'none';
+  });
+  document.querySelectorAll('.progress__step').forEach(el => {
+    const n = parseInt(el.dataset.step);
+    el.classList.toggle('progress__step--active', n === applyStep);
+    el.classList.toggle('progress__step--done', n < applyStep);
+  });
+  const prev = form.querySelector('[data-action="apply-prev"]');
+  const next = form.querySelector('[data-action="apply-next"]');
+  if (prev) prev.style.display = applyStep > 1 ? '' : 'none';
+  if (next) next.textContent = applyStep === 4 ? 'Confirm & Pay' : 'Continue';
+  if (applyStep === 3) {
+    const fd = new FormData(form);
+    const rev = document.getElementById('apply-review');
+    if (rev) rev.innerHTML = `
+      <strong>Student:</strong> ${escapeHTML(fd.get('studentName'))}<br>
+      <strong>DOB:</strong> ${escapeHTML(fd.get('dob'))}<br>
+      <strong>Gender:</strong> ${escapeHTML(fd.get('gender'))}<br>
+      <strong>Grade:</strong> ${escapeHTML(fd.get('grade'))}<br>
+      <strong>Address:</strong> ${escapeHTML(fd.get('address'))}
+    `;
+  }
+}
+
+/* ============================================================
+   EVENT HANDLERS
+   ============================================================ */
+function attachEvents() {
+  // Navigation
+  document.querySelectorAll('[data-nav]').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.preventDefault();
+      const view = el.dataset.nav;
+      if (view === 'parent_apply') { applyStep = 1; navigate('parent_apply'); return; }
+      navigate(view);
+    });
+  });
+
+  // Toggle mobile menu
+  const toggle = document.querySelector('[data-action="toggle-menu"]');
+  if (toggle) toggle.addEventListener('click', () => {
+    document.querySelector('.navbar__menu')?.classList.toggle('navbar__menu--open');
+  });
+
+  // Logout
+  document.querySelectorAll('[data-action="logout"]').forEach(el => el.addEventListener('click', logout));
+
+  // Login form
+  const loginForm = document.getElementById('login-form');
+  if (loginForm) loginForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('login-btn');
+    const err = document.getElementById('login-error');
+    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+    const fd = new FormData(loginForm);
+    const res = await doLogin(fd.get('username'), fd.get('password'));
+    btn.disabled = false; btn.textContent = 'Login';
+    if (!res.ok) { err.textContent = res.error; err.style.display = ''; return; }
+    err.style.display = 'none';
+    toast('Welcome back, ' + res.user.name, 'success');
+    navigate(res.user.role === 'owner' ? 'owner_dash' : 'parent_dash');
+  });
+
+  // Register form
+  const regForm = document.getElementById('register-form');
+  if (regForm) regForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('register-btn');
+    const err = document.getElementById('register-error');
+    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+    const fd = new FormData(regForm);
+    const res = await doRegister({
+      name: fd.get('name'), username: fd.get('username'),
+      password: fd.get('password'), phone: fd.get('phone'), email: fd.get('email')
+    });
+    btn.disabled = false; btn.textContent = 'Create Account';
+    if (!res.ok) { err.textContent = res.error; err.style.display = ''; return; }
+    toast('Account created!', 'success');
+    navigate('parent_dash');
+  });
+
+  // Status lookup
+  const statusForm = document.getElementById('status-form');
+  if (statusForm) statusForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const fd = new FormData(statusForm);
+    const ref = String(fd.get('reference')).trim().toUpperCase();
+    const app = state.applications.find(a => a.reference.toUpperCase() === ref);
+    const box = document.getElementById('status-result');
+    if (!app) {
+      box.innerHTML = `<div class="alert alert--danger">No application found with reference <strong>${escapeHTML(ref)}</strong></div>`;
+      return;
+    }
+    box.innerHTML = `<div class="status-result">
+      <div class="status-result__head">
+        <div><p class="status-result__ref">Reference</p><p class="status-result__name">${escapeHTML(app.reference)}</p></div>
+        ${statusPill(app.status)}
+      </div>
+      <div class="detail-grid detail-grid--2">
+        <div class="detail-item"><span class="detail-item__label">Student</span><span class="detail-item__value">${escapeHTML(app.studentName)}</span></div>
+        <div class="detail-item"><span class="detail-item__label">Grade</span><span class="detail-item__value">${escapeHTML(app.grade)}</span></div>
+        <div class="detail-item"><span class="detail-item__label">Submitted</span><span class="detail-item__value">${fmtDate(app.createdAt)}</s<div class="detail-item"><span class="detail-item__label">Grade</span><span class="detail-item__value">${escapeHTML(app.grade)}</span></div>
+        <div class="detail-item"><span class="detail-item__label">Submitted</span><span class="detail-item__value">${fmtDate(app.createdAt)}</span></div>
+        <div class="detail-item"><span class="detail-item__label">Parent</span><span class="detail-item__value">${escapeHTML(app.parentName)}</span></div>
+      </div>
+    </div>`;
+  });
+
+  // Apply wizard
+  const applyForm = document.getElementById('apply-form');
+  if (applyForm) {
+    applyForm.querySelector('[data-action="apply-next"]')?.addEventListener('click', async () => {
+      // Validate current step
+      const stepEl = applyForm.querySelector(`[data-step="${applyStep}"]`);
+      const inputs = stepEl.querySelectorAll('input[required],select[required],textarea[required]');
+      for (const inp of inputs) {
+        if (!inp.checkValidity()) { inp.reportValidity(); return; }
+      }
+      if (applyStep < 3) { applyStep++; updateApplyStep(); return; }
+      if (applyStep === 3) { applyStep = 4; updateApplyStep(); return; }
+      // Submit
+      const fd = new FormData(applyForm);
+      const res = await submitApplication({
+        studentName: fd.get('studentName'), dob: fd.get('dob'),
+        gender: fd.get('gender'), grade: fd.get('grade'),
+        previousSchool: fd.get('previousSchool'), address: fd.get('address')
+      });
+      if (res.ok) {
+        toast('Application created — pay now', 'success');
+        navigate('parent_dash');
+      }
+    });
+    applyForm.querySelector('[data-action="apply-prev"]')?.addEventListener('click', () => {
+      if (applyStep > 1) { applyStep--; updateApplyStep(); }
+    });
+  }
+
+  // Payments — Pay Now opens modal with UPI QR
+  document.querySelectorAll('[data-action="open-pay"]').forEach(btn => btn.addEventListener('click', () => {
+    const appId = btn.dataset.id;
+    showPayModal(appId);
+  }));
+
+  // Refresh status
+  document.querySelectorAll('[data-action="refresh-status"]').forEach(btn => btn.addEventListener('click', async () => {
+    await bootPull();
+    render();
+    toast('Status refreshed', 'success');
+  }));
+
+  // Approve / reject apps
+  document.querySelectorAll('[data-action="approve-app"]').forEach(btn => btn.addEventListener('click', async () => {
+    if (!confirm('Approve this application?')) return;
+    const res = await approveApp(btn.dataset.id);
+    if (res.ok) { toast('Application approved', 'success'); render(); }
+  }));
+  document.querySelectorAll('[data-action="reject-app"]').forEach(btn => btn.addEventListener('click', async () => {
+    const reason = prompt('Reason for rejection:') || '';
+    if (reason === null) return;
+    const res = await rejectApp(btn.dataset.id, reason);
+    if (res.ok) { toast('Application rejected', 'warning'); render(); }
+  }));
+
+  // Search apps
+  const search = document.getElementById('app-search');
+  if (search) search.addEventListener('input', () => {
+    const q = search.value.toLowerCase().trim();
+    document.querySelectorAll('#apps-table-wrap tbody tr').forEach(row => {
+      row.style.display = !q || (row.dataset.search || '').includes(q) ? '' : 'none';
+    });
+  });
+
+  // Store orders
+  document.querySelectorAll('[data-action="order"]').forEach(btn => btn.addEventListener('click', async () => {
+    const res = await placeOrder(btn.dataset.id);
+    if (res.ok) { toast('Order placed!', 'success'); render(); }
+  }));
+  document.querySelectorAll('[data-action="order-ready"]').forEach(btn => btn.addEventListener('click', async () => {
+    await updateOrderStatus(btn.dataset.id, 'ready'); toast('Marked ready', 'success'); render();
+  }));
+  document.querySelectorAll('[data-action="order-delivered"]').forEach(btn => btn.addEventListener('click', async () => {
+    await updateOrderStatus(btn.dataset.id, 'delivered'); toast('Marked delivered', 'success'); render();
+  }));
+
+  // Broadcast
+  const bForm = document.getElementById('broadcast-form');
+  if (bForm) bForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(bForm);
+    const title = fd.get('title').trim();
+    const body = fd.get('body').trim();
+    state.announcements.push({ id: uid(), title, body, at: new Date().toISOString() });
+    state.users.filter(u => u.role === 'parent').forEach(u => {
+      state.notifications.push({ id: uid(), userId: u.id, title: '📢 ' + title, body, read: false, at: new Date().toISOString() });
+    });
+    await save();
+    toast('Announcement sent to all parents', 'success');
+    render();
+  });
+
+  // Expense form
+  const eForm = document.getElementById('expense-form');
+  if (eForm) eForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(eForm);
+    state.expenses.push({
+      id: uid(), category: fd.get('category'), amount: Number(fd.get('amount')),
+      note: fd.get('note'), at: new Date().toISOString()
+    });
+    await save();
+    toast('Expense added', 'success');
+    render();
+  });
+
+  // Export backup
+  document.querySelectorAll('[data-action="export-backup"]').forEach(btn => btn.addEventListener('click', () => {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'madhi-backup-' + new Date().toISOString().slice(0,10) + '.json';
+    a.click(); URL.revokeObjectURL(url);
+    toast('Backup exported', 'success');
+  }));
+
+  // Notifications
+  document.querySelectorAll('[data-action="mark-read"]').forEach(btn => btn.addEventListener('click', async () => {
+    const n = state.notifications.find(x => x.id === btn.dataset.id);
+    if (n) { n.read = true; await save(); render(); }
+  }));
+  document.querySelectorAll('[data-action="mark-all-read"]').forEach(btn => btn.addEventListener('click', async () => {
+    state.notifications.forEach(n => { if (n.userId === currentUser.id) n.read = true; });
+    await save(); render();
+  }));
+
+  // Avatar upload
+  const avatarInput = document.getElementById('avatar-input');
+  if (avatarInput) avatarInput.addEventListener('change', () => {
+    const file = avatarInput.files[0];
+    if (!file) return;
+    if (file.size > 500 * 1024) { toast('Max 500KB', 'error'); return; }
+    const reader = new FileReader();
+    reader.onload = async () => {
+      currentUser.avatar = reader.result;
+      const u = state.users.find(x => x.id === currentUser.id);
+      if (u) u.avatar = reader.result;
+      await save();
+      toast('Photo updated', 'success');
+      render();
+    };
+    reader.readAsDataURL(file);
+  });
+
+  // View app detail
+  document.querySelectorAll('[data-action="view-app"]').forEach(btn => btn.addEventListener('click', () => {
+    const a = state.applications.find(x => x.id === btn.dataset.id);
+    if (!a) return;
+    alert(
+      'Reference: ' + a.reference + '\n' +
+      'Student: ' + a.studentName + '\n' +
+      'Grade: ' + a.grade + '\n' +
+      'Status: ' + a.status + '\n' +
+      'Submitted: ' + fmtDateTime(a.createdAt)
+    );
+  }));
+}
+
+/* ============================================================
+   PAY MODAL
+   ============================================================ */
+function showPayModal(appId) {
+  const fee = state.settings.applicationFee;
+  const upi = state.settings.upiId;
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(11,45,92,.55);display:grid;place-items:center;z-index:9999;padding:16px';
+  overlay.innerHTML = `
+    <div class="card" style="max-width:420px;width:100%;position:relative">
+      <button style="position:absolute;top:12px;right:12px;border:none;background:transparent;font-size:22px;cursor:pointer" data-close>✕</button>
+      <h3 class="card__title">Pay Application Fee</h3>
+      <p class="card__subtitle">Scan the QR or use UPI ID</p>
+      <div style="display:grid;place-items:center;padding:16px;background:#F8FAFC;border-radius:12px;margin-bottom:16px">
+        <div id="upi-qr"></div>
+      </div>
+      <div class="detail-item mb-4">
+        <span class="detail-item__label">UPI ID</span>
+        <span class="detail-item__value">${escapeHTML(upi)}</span>
+      </div>
+      <div class="detail-item mb-4">
+        <span class="detail-item__label">Amount</span>
+        <span class="detail-item__value">${fmtINR(fee)}</span>
+      </div>
+      <div class="flex gap-2" style="flex-wrap:wrap">
+        <a class="btn btn--primary" href="upi://pay?pa=${encodeURIComponent(upi)}&pn=Madhi+School&am=${fee}&cu=INR&tn=Admission+Fee">Pay via UPI App</a>
+        <button class="btn btn--outline" data-copy>Copy UPI ID</button>
+        <button class="btn btn--navy btn--block" data-paid style="margin-top:8px">I Have Paid</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  setTimeout(() => {
+    const el = overlay.querySelector('#upi-qr');
+    if (el && typeof QRCode !== 'undefined') {
+      try { new QRCode(el, { text: `upi://pay?pa=${encodeURIComponent(upi)}&pn=Madhi+School&am=${fee}&cu=INR&tn=Admission+Fee`, width: 200, height: 200 }); } catch (e) {}
+    }
+  }, 100);
+
+  overlay.querySelector('[data-close]').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('[data-copy]').addEventListener('click', () => {
+    navigator.clipboard.writeText(upi).then(() => toast('UPI ID copied', 'success'));
+  });
+  overlay.querySelector('[data-paid]').addEventListener('click', async () => {
+    const res = await markPaid(appId);
+    overlay.remove();
+    if (res.ok) { toast('Payment sent for review', 'success'); render(); }
+    else toast('Failed: ' + (res.error||''), 'error');
+  });
+}
+
+/* ============================================================
+   PWA
+   ============================================================ */
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  const banner = document.createElement('div');
+  banner.style.cssText = 'position:fixed;left:16px;right:16px;bottom:16px;background:#0B2D5C;color:#fff;padding:12px 16px;border-radius:12px;display:flex;justify-content:space-between;align-items:center;gap:12px;z-index:9000;box-shadow:0 12px 32px rgba(0,0,0,.25)';
+  banner.innerHTML = `<span>Install Madhi app for quick access</span>
+    <span class="flex gap-2"><button class="btn btn--accent btn--sm" data-install>Install</button>
+    <button class="btn btn--ghost btn--sm" data-dismiss>Later</button></span>`;
+  document.body.appendChild(banner);
+  banner.querySelector('[data-install]').addEventListener('click', async () => {
+    banner.remove();
+    if (deferredPrompt) { deferredPrompt.prompt(); deferredPrompt = null; }
+  });
+  banner.querySelector('[data-dismiss]').addEventListener('click', () => banner.remove());
+});
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch((e) => log('sw register fail', e));
+  });
+}
+
+/* ============================================================
+   INIT
+   ============================================================ */
+(async function init() {
+  await bootPull();
+  await ensureOwner();
+  restoreSession();
+  if (currentUser) {
+    if (currentUser.role === 'owner') navigate('owner_dash');
+    else navigate('parent_dash');
+  } else {
+    navigate('landing');
+  }
+})();
+</script>
+</body>
+</html>
